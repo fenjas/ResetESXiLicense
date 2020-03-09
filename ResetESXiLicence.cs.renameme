@@ -1,0 +1,142 @@
+﻿using Renci.SshNet;
+using System;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
+
+//Resets the license on an ESXi host to the default 60 day trial period (Jason 5/4/18)
+public class ResetESXiLicence
+{
+    static string password = null;
+   
+    //Event handler for password prompt
+    public static void HandleKeyEvent(Object sender, Renci.SshNet.Common.AuthenticationPromptEventArgs e)
+    {
+        foreach (Renci.SshNet.Common.AuthenticationPrompt prompt in e.Prompts)
+        {
+            if (prompt.Request.IndexOf("Password:", StringComparison.InvariantCultureIgnoreCase) != -1)
+            {
+                prompt.Response = password;
+            }
+        }
+    }
+
+    //Start SSH service using PowerCLI (assuming it is installed)
+    private static void EnableSSHOnHost(string ESXIP, string user = "", string pwd = "")
+    {
+        string psCmd1 = @"Import-Module VMware.VimAutomation.Core";
+        string psCmd2 = string.Format("Connect-VIServer {0} -user {1} -Password {2}",ESXIP, user, pwd);
+        string psCmd3 = @"get-vmhostservice | where {$_.Key -eq ""TSM-SSH""} | Start-VMHostService";
+        string psCmd4 = @"Disconnect-VIServer * -Confirm:$false";
+
+        string scriptBlock = psCmd1 + "\r\n" + psCmd2 + "\r\n" + psCmd3 + "\r\n" + psCmd4;
+
+        try
+        {
+            RunspaceInvoke ri = new RunspaceInvoke();
+            var scriptBlockResult = ri.Invoke(scriptBlock);
+
+            Console.WriteLine("PowerCLI scriptblock:");
+            foreach (var o in scriptBlock)
+            {
+                Console.Write(o.ToString());
+            }
+            Console.WriteLine("\r\n");
+
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex.Message);
+        }
+    }
+
+    //Reset ESXi evaluation license via SSH
+    private static void ResetLicense(SshClient sshclient)
+    {
+        //Connect to SSH if connection was dropped
+        if (!sshclient.IsConnected) sshclient.Connect();
+        
+        //Remove current license
+        sshclient.RunCommand("rm -r /etc/vmware/license.cfg");
+
+        //Copy new license
+        sshclient.RunCommand("cp /etc/vmware/.#license.cfg /etc/vmware/license.cfg");
+
+        //Restart service
+        sshclient.RunCommand("/etc/init.d/vpxa restart");
+
+        //Disconnect from ESXi
+        sshclient.Disconnect();
+
+        Console.WriteLine("License has been reset!");
+    }
+    
+    
+    public static void ResetLicence(string ESXIP, string user = "", string pwd = "")
+    {
+
+        //Fall to using default credentials
+        if (string.IsNullOrEmpty(user)) user = "root";
+        if (string.IsNullOrEmpty(pwd)) password = "Password123"; else password = pwd;
+
+        try
+        {
+            //If IP address is provided ...
+            if (!string.IsNullOrEmpty(ESXIP))
+            {
+                KeyboardInteractiveAuthenticationMethod kauth = new KeyboardInteractiveAuthenticationMethod(user);
+                PasswordAuthenticationMethod pauth = new PasswordAuthenticationMethod(user, password);
+
+                kauth.AuthenticationPrompt += new EventHandler<Renci.SshNet.Common.AuthenticationPromptEventArgs>(HandleKeyEvent);
+                ConnectionInfo connectionInfo = new ConnectionInfo(ESXIP, user, pauth, kauth);
+
+                var client = new SshClient(connectionInfo);
+                client.KeepAliveInterval = TimeSpan.FromSeconds(60);
+
+                //Connect to ESXi
+                try
+                {
+                    client.Connect();
+                }
+                catch
+                {
+                    Console.WriteLine("Could not establish a connection. Let's try and enable SSH via PowerCLI!");
+                    EnableSSHOnHost(ESXIP,user,pwd);
+                    ResetLicense(client);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("Failed to reset ESXi license. " + e.Message);
+        }
+    }
+
+    public static void Main(string[] args)
+    {
+        string IPaddress = null;
+        string user = null;
+
+        if (args.Length != 0)
+        {
+            if (args.Length == 1)
+            {
+                IPaddress = args[0];
+            }
+            else
+               if (args.Length == 3)
+            {
+                IPaddress = args[0];
+                user = args[1];
+                password = args[2];
+            }
+
+            ResetLicence(IPaddress, user, password);
+        }
+        else
+        {
+            Console.WriteLine("Running this tool resets the evaluation license on an ESXi server.");
+            Console.WriteLine("Usage: ResetESXiLic <ip address> <user> <password>");
+        }
+
+    }
+}
